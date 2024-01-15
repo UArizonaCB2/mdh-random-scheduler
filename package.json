@@ -1,0 +1,20 @@
+{
+  "name": "mdh-random-scheduler",
+  "version": "1.0.0",
+  "description": "Create random schedules for MDH participants.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Shravan Aras <shravanaras@cs.arizona.edu>",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-eventbridge": "^3.484.0",
+    "@aws-sdk/client-secrets-manager": "^3.485.0",
+    "axios": "^1.6.3",
+    "dotenv": "^16.3.1",
+    "jsonwebtoken": "^9.0.2",
+    "util": "^0.12.5",
+    "uuid": "^9.0.1"
+  }
+}
