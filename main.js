@@ -40,6 +40,7 @@ async function main(args) {
     if (process.env.RKS_SERVICE_ACCOUNT && process.env.RKS_PRIVATE_KEY) {
       console.log('Using MDH credentials from environment variables')
       rksServiceAccount = process.env.RKS_SERVICE_ACCOUNT
+
       rksProjectId = process.env.RKS_PROJECT_ID
       privateKey = process.env.RKS_PRIVATE_KEY
     }
@@ -78,9 +79,8 @@ async function main(args) {
       /* Create Event Bridge schedule to manage this on AWS. */
       for (const utcTime of schedule) {
         const res = await putScheduleEvent(participant.participantIdentifier, utcTime)
-        console.log(res)
         if (res == null) {
-          // TODO: Add to logs that schedule could not be created.
+          // TODO: Add to logs that schedule could not be created and do not update the MDH bits.
         }
       }
       // Add the new date to the participant custom field.
@@ -93,6 +93,7 @@ async function main(args) {
       /* TODO: Make sure to check the response to know if this
        * has been set for the user. If not raise an error in the logs.
        */
+      console.log('Added schedule for participant '+participant.participantIdentifier+' for '+formatDateUTC(localTime)+'(local)')
     }
     else {
       console.log('Participant '+participant.participantIdentifier+' already has schedule for '+formatDateUTC(localTime)+'(local)')
@@ -146,7 +147,7 @@ async function putScheduleEvent(participantId, utcDate) {
  * @returns {stirng} Formatted string of the date YYYY-MM-DD
  */
 function formatDateUTC(date) {
-  return date.getUTCFullYear() + '-' + date.getUTCMonth() + '-' + date.getUTCDay()
+  return date.getUTCFullYear() + '-' + (date.getUTCMonth() + 1) + '-' + date.getUTCDate()
 }
 
 /*
