@@ -58,29 +58,59 @@ async function main(args) {
     return null
   }
 
+  // Object that logs the overall summary stats from this.
+  let summaryLog = {
+    Participants : {
+      Parsed : 0,
+      NotificationReady : 0,
+      RulesAdded : 0,
+      MarkedForAddition : 0,
+      Failed : []
+    },
+    Deleted : {
+      Marked : 0,
+      Deleted : 0,
+      Failed : []
+    }
+  }
+
   const participants = await mdh.getAllParticipants(token, rksProjectId)
   for (const participant of participants.participants) {
     if (participant.demographics.utcOffset == null)
       continue
 
+    summaryLog.Participants.Parsed += 1
+
     let localTime = getParticipantLocalTime(participant)
     let generatedTill = getCustomField(participant, customFieldName)
     let notificationReady = getCustomField(participant, randomNotificationReady)
+
+    const res = await deleteParticipantRules(participant.participantIdentifier, formatDateUTC(localTime))
+    summaryLog.Deleted.Marked += res.markedForDelete
+    summaryLog.Deleted.Deleted += res.deleted
 
     // Only move ahead if EMA notifications are enabled for the participant.
     if (notificationReady != 'yes') {
       continue
     }
 
+    summaryLog.Participants.NotificationReady += 1
+
     if (generatedTill == null || generatedTill.trim() != formatDateUTC(localTime)) {
+      summaryLog.Participants.MarkedForAddition += 1
       // Run the schedule, so we can create the random notification times.
       let schedule = makeRandomSchedule(participant, times, randomInterval)
 
       /* Create Event Bridge schedule to manage this on AWS. */
+
       for (const utcTime of schedule) {
         const res = await putScheduleEvent(participant.participantIdentifier, utcTime)
         if (res == null) {
           // TODO: Add to logs that schedule could not be created and do not update the MDH bits.
+          summaryLog.Participants.Failed.push({
+            ParticipantId : participant.participantIdentifier,
+            RuleName : createRuleName(participant.participantIdentifier, utcTime)
+          })
         }
       }
       // Add the new date to the participant custom field.
@@ -94,10 +124,54 @@ async function main(args) {
        * has been set for the user. If not raise an error in the logs.
        */
       console.log('Added schedule for participant '+participant.participantIdentifier+' for '+formatDateUTC(localTime)+'(local)')
+      summaryLog.Participants.RulesAdded += 1
     }
     else {
       console.log('Participant '+participant.participantIdentifier+' already has schedule for '+formatDateUTC(localTime)+'(local)')
     }
+  }
+
+  console.log(JSON.stringify(summaryLog, null, 2))
+}
+
+/*
+ * Method which given a pid, deletes all the rules prior to the current date of the participant.
+ */
+async function deleteParticipantRules(participantId, currentDate) {
+  const prefix = project_name + '_' + participantId
+  let participantRules = await eventBridge.listRulesByPrefix(prefix)
+  // Convert currentDate from string to a date object.
+  const cd = new Date(currentDate)
+
+  let markedForDelete = 0
+  let deleted = 0
+  let failed = []
+
+  for (const rule of participantRules) {
+    // Extract the date from the cron string.
+    const scheduleExpression = rule.ScheduleExpression
+    const dp = scheduleExpression.split('(')[1].split(')')[0].split(' ')
+    const jobDate = new Date(dp[5]+'-'+dp[3]+'-'+dp[2])
+
+
+    // If the cron job is older than the current time for the participant we need
+    // to remove it.
+    if (jobDate < cd) {
+      console.log('Rule '+rule.Name+' falls before current date '+currentDate+'. Ready to delete.')
+      markedForDelete += 1
+      const delres = eventBridge.deleteRule(rule.Name)
+      if (delres) {
+        deleted += 1
+      }
+      else {
+        failed.push(rule.Name)
+      }
+    }
+  }
+
+  return {
+    markedForDelete : markedForDelete,
+    deleted : deleted
   }
 }
 
@@ -106,7 +180,7 @@ async function main(args) {
  */
 async function putScheduleEvent(participantId, utcDate) {
   // Test out Event Bridge here.
-  let schedule_name = project_name + '_' + participantId + '_' + formatDateUTC(utcDate) + '_' + utcDate.getUTCHours() + '_' + utcDate.getUTCMinutes()
+  let schedule_name = createRuleName(participantId, utcDate)
   const params = {
     Name: schedule_name,
     Description: 'Automatic schedule generated for project '+project_name,
@@ -116,7 +190,6 @@ async function putScheduleEvent(participantId, utcDate) {
       {Key: 'project', Value: project_name},
       {Key: 'Partcipant', Value: participantId}
     ],
-   //RoleArn: roleArn,
   }
 
  const res = await eventBridge.addSchedule(params)
@@ -136,6 +209,13 @@ async function putScheduleEvent(participantId, utcDate) {
   }
 
   return res
+}
+
+/*
+ * Method which creates the rule name.
+ */
+function createRuleName(participantId, utcDate) {
+  return project_name + '_' + participantId + '_' + formatDateUTC(utcDate) + '_' + utcDate.getUTCHours() + '_' + utcDate.getUTCMinutes()
 }
 
 /*
