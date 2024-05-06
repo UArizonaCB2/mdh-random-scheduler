@@ -10,6 +10,7 @@
   "license": "ISC",
   "dependencies": {
     "@aws-sdk/client-eventbridge": "^3.484.0",
+    "@aws-sdk/client-scheduler": "^3.565.0",
     "@aws-sdk/client-secrets-manager": "^3.485.0",
     "axios": "^1.6.3",
     "dotenv": "^16.3.1",
