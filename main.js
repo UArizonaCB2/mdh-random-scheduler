@@ -1,10 +1,13 @@
 const mdh = require('./mdh')
 const eventBridge = require('./EventBridge')
 const secretManager = require('./SecretsManager')
+const {DateTime, Duration} = require('luxon')
+const fs = require('node:fs')
 require('dotenv').config()
 
 /*
  * TODO:
+ * 1. Handle when sleep times are past midnight. For example - 01:00. These would need to be correct date adjusted.
  */
 
 // **NOTE!** In a real production app you would want these to be sourced from real environment variables. The .env file is just
@@ -14,10 +17,19 @@ const project_name = process.env.PROJECT_NAME
 const roleArn = process.env.AWS_ROLE_ARN
 const targetArn = process.env.AWS_TARGET_ARN
 
-const times = ['10:12', '12:24', '14:36', '16:48', '19:00']
-const randomInterval = 15
 const customFieldName = 'scheduleGenerated'
 const randomNotificationReady = 'randomNotificationReady'
+
+const customFields = {
+  scheduleGenerated : 'scheduleGenerated',
+  weekdayWakeTime : 'weekdayWakeTime',
+  weekdaySleepTime : 'weekdaySleepTime',
+  weekendWakeTime : 'weekendWakeTime',
+  weekendSleepTime : 'weekendSleepTime',
+  startDate : 'startDate'
+}
+
+const NEWLINE = '\n'
 
 async function main(args) {
   let rksServiceAccount = null
@@ -74,22 +86,38 @@ async function main(args) {
     }
   }
 
+  // Read in the supporting files needed.
+  files = supportingFiles()
+
   const participants = await mdh.getAllParticipants(token, rksProjectId)
   for (const participant of participants.participants) {
-    if (participant.demographics.utcOffset == null)
+    if (participant.demographics.timeZone == null)
       continue
 
     summaryLog.Participants.Parsed += 1
 
-    let localTime = getParticipantLocalTime(participant)
-    let generatedTill = getCustomField(participant, customFieldName)
-    let notificationReady = getCustomField(participant, randomNotificationReady)
+    let scheduleGenerated = getCustomField(participant, customFields.scheduleGenerated)
+    let custStartDate = getCustomField(participant, customFields.startDate)
+    // Parse this into luxon:DateTime with the participant timezone.
+    let startDate = DateTime.fromISO(custStartDate).setZone(participant.demographics.timeZone)
+    if (Number.isNaN(startDate.year)) {
+      // There was an error parsing the format.
+      logParticipantError(participant, 'Invalid ISO DateTime format for custom field startDate. Got '+custStartDate+ ' expected yyyy-mm-dd')
+      continue
+    }
+    // Get the wake and sleep times and populate them.
+    let wakesleep = populateWakeSleep(participant)
 
-    const res = await deleteParticipantRules(participant.participantIdentifier, formatDateUTC(localTime))
-    summaryLog.Deleted.Marked += res.markedForDelete
-    summaryLog.Deleted.Deleted += res.deleted
+    makeRandomSchedule(participant, startDate, wakesleep, files.anchors, files.randomInterval, true)
+
+    /*
+      const res = await deleteParticipantRules(participant.participantIdentifier, formatDateUTC(localTime))
+      summaryLog.Deleted.Marked += res.markedForDelete
+      summaryLog.Deleted.Deleted += res.deleted
+    */
 
     // Only move ahead if EMA notifications are enabled for the participant.
+    notificationReady = 'no'
     if (notificationReady != 'yes') {
       continue
     }
@@ -102,6 +130,7 @@ async function main(args) {
       let schedule = makeRandomSchedule(participant, times, randomInterval)
 
       /* Create Event Bridge schedule to manage this on AWS. */
+
 
       for (const utcTime of schedule) {
         const res = await putScheduleEvent(participant.participantIdentifier, utcTime)
@@ -135,9 +164,136 @@ async function main(args) {
 }
 
 /*
+ * Populate wake and sleep times from custom fields.
+ */
+function populateWakeSleep(participant) {
+  let wakesleep = {
+    weekend : {
+      wake: null,
+      sleep: null,
+    },
+    weekday : {
+      wake: null,
+      sleep: null,
+    }
+  }
+
+  wakesleep.weekday.wake = parseWSTime(getCustomField(participant, customFields.weekdayWakeTime))
+  if (wakesleep.weekday.wake == null) {
+    logParticipantError(participant, 'Invalid format for weekday wake time in custom field. Must be (hh:mm)')
+  }
+  wakesleep.weekday.sleep = parseWSTime(getCustomField(participant, customFields.weekdaySleepTime))
+  if (wakesleep.weekday.sleep == null) {
+    logParticipantError(participant, 'Invalid format for weekday sleep time in custom field. Must be (hh:mm)')
+  }
+  wakesleep.weekend.wake = parseWSTime(getCustomField(participant, customFields.weekendWakeTime))
+  if (wakesleep.weekend.wake == null) {
+    logParticipantError(participant, 'Invalid format for weekend wake time in custom field. Must be (hh:mm)')
+  }
+  wakesleep.weekend.sleep = parseWSTime(getCustomField(participant, customFields.weekendSleepTime))
+  if (wakesleep.weekend.sleep == null) {
+    logParticipantError(participant, 'Invalid format for weekend sleep time in custom field. Must be (hh:mm)')
+  }
+
+  return wakesleep
+}
+
+/*
+ * Method which breaks down a time string of form (hh:mm) and converts it to a luxon:Duration
+ * object with the participants local timezone.
+ * @param {String} time - hh:mm format time.
+ * @param {String} zone - time zone locale.
+ * @returns {luxon:Duration} - In case of an error, null is returned.
+ */
+function parseWSTime(time) {
+  let buff = time.split(':')
+  if (buff.length < 2) {
+    return null
+  }
+
+  try {
+    let dt = Duration.fromObject({
+      hours: Number.parseInt(buff[0]),
+      minutes: Number.parseInt(buff[1])
+    })
+
+    return dt
+  }
+  catch (err) {
+    return null
+  }
+
+  return null
+}
+
+/*
+ * Method which console logs participant error.
+ * @param {Object} participant - MDH participant object.
+ * @returns {string} The error string generated.
+ */
+function logParticipantError(participant, message) {
+  errorString = 'Error: ('+participant.participantIdentifier+') - '+message
+  console.log(errorString)
+
+  return errorString
+}
+
+/*
+ * Method which reads the supporting files - offsets.csv, weekday.csv, weekend.csv
+ * either from a specified S3 location or from the local code invocation location.
+ * These are returned in `anchors` and `randomInterval`
+ * Note - Small files, we can read them in memory fully, don't need streams.
+ */
+function supportingFiles(filenames = {offsets:'offsets.csv', weekday:'weekday.csv', weekend:'weekend.csv'}) {
+  // Weekend files.
+  let weekend_lines = splitLines(fs.readFileSync(filenames.weekend, 'utf8'))[0]
+  let weekend = weekend_lines.split(',')
+  weekend = trimUTFArray(weekend)
+  // Weekday files.
+  let weekday_lines = splitLines(fs.readFileSync(filenames.weekday, 'utf8'))[0]
+  let weekday = weekday_lines.split(',')
+  weekday = trimUTFArray(weekday)
+  // Offset table or matrix.
+  let offset_lines = splitLines(fs.readFileSync(filenames.offsets, 'utf8'))
+  offsets = []
+  for (const line of offset_lines) {
+    offsets.push(trimUTFArray(line.split(',')))
+  }
+
+  return {
+    anchors : {
+      weekday : weekday,
+      weekend : weekend
+    },
+    randomInterval : offsets
+  }
+}
+
+/*
+ * Given an array, it trims each element of the array.
+ * All non-numeric strings are converted to NaN.
+ */
+function trimUTFArray(array) {
+  for (let i=0; i < array.length; i++) {
+    array[i] = array[i].trim()
+    array[i] = Number.parseInt(array[i])
+  }
+
+  return array
+}
+
+/*
+ * Wrapper method that returns lines as buffer
+ */
+function splitLines(buffer) {
+  return buffer.trim().split(NEWLINE)
+}
+
+/*
  * Method which given a pid, deletes all the rules prior to the current date of the participant.
  */
 async function deleteParticipantRules(participantId, currentDate) {
+  throw new Error('Modify')
   const prefix = project_name + '_' + participantId
   let participantRules = await eventBridge.listRulesByPrefix(prefix)
   // Convert currentDate from string to a date object.
@@ -180,6 +336,7 @@ async function deleteParticipantRules(participantId, currentDate) {
  */
 async function putScheduleEvent(participantId, utcDate) {
   // Test out Event Bridge here.
+  throw new Error('Modify')
   let schedule_name = createRuleName(participantId, utcDate)
   const params = {
     Name: schedule_name,
@@ -213,9 +370,12 @@ async function putScheduleEvent(participantId, utcDate) {
 
 /*
  * Method which creates the rule name.
+ * @param {string} participantId - MDH participant ID.
+ * @param {luxon:DateTime} date - date to add to the rule name.
+ * @returns {string} rule name
  */
-function createRuleName(participantId, utcDate) {
-  return project_name + '_' + participantId + '_' + formatDateUTC(utcDate) + '_' + utcDate.getUTCHours() + '_' + utcDate.getUTCMinutes()
+function createRuleName(participantId, date) {
+  return project_name + '_' + participantId + '_' + formatDate(date) + '_' + date.hour + '_' + date.minute
 }
 
 /*
@@ -223,11 +383,11 @@ function createRuleName(participantId, utcDate) {
  * Writing my own so there is not automatic timezone conversion when using the library
  * string methods.
  * So if this runs on the servers, this will automatically be converted to localtime.
- * @params {Date} date - Date object to format.
+ * @params {luxon:DateTime} date - Date object to format.
  * @returns {stirng} Formatted string of the date YYYY-MM-DD
  */
-function formatDateUTC(date) {
-  return date.getUTCFullYear() + '-' + (date.getUTCMonth() + 1) + '-' + date.getUTCDate()
+function formatDate(date) {
+  return date.year + '-' + date.month + '-' + date.day
 }
 
 /*
@@ -245,89 +405,109 @@ function getCustomField(participant, fieldName) {
 }
 
 /*
- * Method which creates a random schedule for each participant for a single day
+ * Method which creates a random schedule for the participant for all 8 days (including the final morning)
  * @param {object} participant - Object that contains all the participant information.
- * @param {array} times - A array of strings (hh:mm) around which the randomization will take place.
- * @param {int} randomInternal - The number of minutes around the actual time to create the random schedule.
+ * @param {luxon:DateTime} startDate - Local timezone date when we want the EMA notifications to start for the
+ *        participant
+ * @param {object} wakesleep - {weekday:{wake:luxon:Duration, sleep:luxon:Duration}, weekend:{wake, sleep}}
+ * @param {object} anchors - {weekday:[min, min,...], weekend:[min, min, ..]} Time anchor in minutes.
+ * @param {array} randomInterval - m (days) x n (surveys) array of signed random offsets to add to anchor points in minutes.
  * */
-function makeRandomSchedule(participant, times, randomInterval) {
+function makeRandomSchedule(participant, startDate, wakesleep, anchors, randomInterval, logger=false) {
   let randomUTCTimes = []
 
-  if (participant.demographics.utcOffset == null)
+  if (participant.demographics.timeZone == null)
     return []
 
-  let minuteOffset = getPartcipantUTCOffset(participant)
   // Now let us get the current local time for this participant (saved in the object as UTC).
   let today = getParticipantLocalTime(participant)
 
-  let year = today.getUTCFullYear()
-  let month = today.getUTCMonth()
-  let day = today.getUTCDay()
-
   let log = []
-  for (const time of times) {
-    let hh = time.split(':')[0]
-    let min = time.split(':')[1]
-    let rand = getRandom(1, randomInterval*2)
-    rand = (rand < randomInterval) ? -1 * rand : rand - randomInterval
 
-    // Passing .getTime() does not do any automatic timezone conversion.
-    let ltime = new Date(today.getTime())
-    // Convert it to midnight.
-    ltime.setTime(ltime.getTime() - ltime.getUTCHours()*60*60*1000
-                  - ltime.getUTCMinutes()*60*1000
-                  - ltime.getUTCSeconds()*1000
-                  - ltime.getUTCMilliseconds())
-    // Add the hh:mm offset for the correct anchor point.
-    ltime.setTime(ltime.getTime() + parseInt(hh)*60*60*1000 + parseInt(min)*60*1000)
-    // For debug purposes what is the fixed local time (anchor)
-    let fixedLocalTime = new Date(ltime.getTime())
-    // Adjust the time with the random offset
-    ltime.setTime(ltime.getTime() + rand*60*1000)
-    // Convert the time back into UTC.
-    utctime = convToUTC(ltime, minuteOffset)
-    log.push({'id': participant.participantIdentifier,
-                   'fixedLocalTime': fixedLocalTime.toUTCString(),
-                   'randomLocalTime': ltime.toUTCString(),
-                   'randomUTCTime': utctime.toUTCString(),
-                   'randomOffsetMins': rand,
-                   'utcOffset': minuteOffset})
+  for (let day=0; day < randomInterval.length; day++) {
+    let todayStart = startDate.plus(Duration.fromObject({days:day}))
+    let todayEnd = startDate.plus(Duration.fromObject({days:day}))
+    let todayAnchors = null
 
-    randomUTCTimes.push(utctime)
+    // Check if this is the weekend (Sat, Sun) weekday of 6,7
+    // and then adjust the start and end times accordingly based on wake and sleep
+    if (todayStart.weekday == 6 || todayStart.weekday == 7) {
+      todayStart = todayStart.plus(wakesleep.weekend.wake)
+      todayEnd = todayEnd.plus(wakesleep.weekend.sleep)
+      todayAnchors = anchors.weekend
+    }
+    else { // Weekday
+      todayStart = todayStart.plus(wakesleep.weekday.wake)
+      todayEnd = todayEnd.plus(wakesleep.weekday.sleep)
+      todayAnchors = anchors.weekday
+    }
+    for (let survey=0; survey < randomInterval[day].length; survey++) {
+      // If we need to a skip a particular delivery time, then this will be NaN in the interval table.
+      if (Number.isNaN(randomInterval[day][survey])) {
+        continue
+      }
+      let randomOffset = randomInterval[day][survey]
+      let fixedLocalTime = null
+      // Except for the last survey, all others are anchored from the wake up time.
+      // dayStart/End +- surveyAnchor + randomOffset
+      if (todayAnchors[survey] >= 0) {  // Positive anchors are offset from the day start.
+        fixedLocalTime = todayStart.plus(Duration.fromObject({minutes:todayAnchors[survey]}))
+      }
+      else {  // A negative daily anchor is offsetted from the sleep time.
+        fixedLocalTime = todayEnd.minus(Duration.fromObject({minutes:todayAnchors[survey]}))
+      }
+      // Add the pre-determined random offset for this (day, survey)
+      let randomLocalTime = fixedLocalTime.plus(Duration.fromObject({minutes:randomInterval[day][survey]}))
+
+      // Convert this to UTC and then add it to the scheduling array.
+      let utcTime = convToUTC(randomLocalTime)
+      randomUTCTimes.push(utcTime)
+      log.push({'id': participant.participantIdentifier,
+                'timeZone': participant.demographics.timeZone,
+                'wakeUp' : todayStart.toLocaleString(DateTime.DATETIME_FULL),
+                'sleep' : todayEnd.toLocaleString(DateTime.DATETIME_FULL),
+                'fixedLocalTime': fixedLocalTime.toLocaleString(DateTime.DATETIME_FULL),
+                'randomLocalTime': randomLocalTime.toLocaleString(DateTime.DATETIME_FULL),
+                'randomUTCTime': utcTime.toLocaleString(DateTime.DATETIME_FULL),
+                'randomOffsetMins': randomInterval[day][survey],
+                'day_survey': day+','+survey})
+    }
+  }
+
+  if (logger) {
+    console.log(log)
   }
 
   return randomUTCTimes
 }
 
 /* Get participant utc offset in minutes */
+/* DEPRECIATED - We have moved to timeZone locale now. */
 function getPartcipantUTCOffset(participant) {
-  if (participant.demographics.utcOffset == null)
+  throw new Error('Depreciated Method : getParticipantUTCOffset()')
+}
+
+/*
+ * Method which returns the participant timeZone string.
+ * @param {Object} participant - Object containing all the participant information.
+ */
+function getParticipantTimeZone(participant) {
+  if (participant === null) {
     return null
-
-  let utcOffset = participant.demographics.utcOffset
-  let buff = utcOffset.split(':')
-  let minuteOffset = 0
-  // Need to do a few extra things for the sign.
-  if (parseInt(buff[0]) < 0) {
-    minuteOffset = buff[0]*60 - buff[1]
-  }
-  else {
-    minuteOffset = buff[0]*60 + buff[1]
   }
 
-  return minuteOffset
+  return participant.demographics.timeZone
 }
 
 /*
  * Method which returns the current local time for the participant.
+ * Makes use of the luxon library.
  * @param {Object} participant - Object containing all the participant information.
- * @returns {DateTime} Current local date and time for the participant
+ * @returns {LuxonObject} Returns a luxon date object with local timeset.
  */
 function getParticipantLocalTime(participant) {
-
-  let minuteOffset = getPartcipantUTCOffset(participant)
-  // Now let us get the current local time for this participant.
-  let today = convToLocal(new Date(), minuteOffset)
+  let timeZone = getParticipantTimeZone(participant)
+  let today = DateTime.now().setZone(timeZone)
 
   return today
 }
@@ -343,26 +523,28 @@ function getRandom(min, max) {
 }
 
 /*
+ * DEPRECIATED / UNUSED
  * Convert the given time from utc to local time.
  * @param {DateTime} utcTime - UTC Time
  * @param {int} utcOffset - UTC offset in minutes
  * @returns {DateTime} Local time.
  */
 function convToLocal(utcTime, utcOffset) {
-  time = new Date(utcTime.getTime())  // Using .getTime() avoids any automatic timezone conversions.
-  time.setTime(time.getTime() + utcOffset*60*1000)
+  throw new Error('Depreciated Method : convToLocal()')
 
   return time
 }
 
 /*
  * Convert the given time from local to utc.
- * @param {DateTime} localTime - Local time
- * @param {int} utcOffset - UTC Offset
- * @returns {DateTime} UTC time
+ * @param {luxon:DateTime} localTime - Local time
+ * @returns {luxon:DateTime} UTC time
  */
-function convToUTC(localTime, utcOffset) {
-  return convToLocal(localTime, -1 * utcOffset)
+function convToUTC(localTime) {
+  if (localTime === null) {
+    return null
+  }
+  return localTime.toUTC()
 }
 
 exports.main = main
