@@ -1,13 +1,17 @@
 const mdh = require('./mdh')
-const eventBridge = require('./EventBridge')
 const secretManager = require('./SecretsManager')
+const eventScheduler = require('./EventScheduler')
 const {DateTime, Duration} = require('luxon')
 const fs = require('node:fs')
 require('dotenv').config()
 
 /*
  * TODO:
- * 1. Handle when sleep times are past midnight. For example - 01:00. These would need to be correct date adjusted.
+ * 1. (High) Handle when sleep times are past midnight. For example - 01:00. These would need to be correct date adjusted.
+ * 2. (Low) What should we do in case of partial failures with Event Bridge. Roll backs of some sort?
+ * 3. (Low) MDH API failure to custom fields.
+ * BUGS 
+ * 1. The signs for the anchor points with respective to sleep are not getting picked up. For example -60. 
  */
 
 // **NOTE!** In a real production app you would want these to be sourced from real environment variables. The .env file is just
@@ -16,6 +20,7 @@ const rksProjectId = process.env.RKS_PROJECT_ID
 const project_name = process.env.PROJECT_NAME
 const roleArn = process.env.AWS_ROLE_ARN
 const targetArn = process.env.AWS_TARGET_ARN
+const eventGroup = process.env.AWS_EVENT_GROUP
 
 const customFieldName = 'scheduleGenerated'
 const randomNotificationReady = 'randomNotificationReady'
@@ -108,30 +113,19 @@ async function main(args) {
     // Get the wake and sleep times and populate them.
     let wakesleep = populateWakeSleep(participant)
 
-    makeRandomSchedule(participant, startDate, wakesleep, files.anchors, files.randomInterval, true)
-
     /*
       const res = await deleteParticipantRules(participant.participantIdentifier, formatDateUTC(localTime))
       summaryLog.Deleted.Marked += res.markedForDelete
       summaryLog.Deleted.Deleted += res.deleted
     */
 
-    // Only move ahead if EMA notifications are enabled for the participant.
-    notificationReady = 'no'
-    if (notificationReady != 'yes') {
-      continue
-    }
-
-    summaryLog.Participants.NotificationReady += 1
-
-    if (generatedTill == null || generatedTill.trim() != formatDateUTC(localTime)) {
+    if (scheduleGenerated === 'no') { /* Only generate a schedule if it has not already been generated before. */
+      summaryLog.Participants.NotificationReady += 1
       summaryLog.Participants.MarkedForAddition += 1
       // Run the schedule, so we can create the random notification times.
-      let schedule = makeRandomSchedule(participant, times, randomInterval)
-
+      let schedule = makeRandomSchedule(participant, startDate, wakesleep, files.anchors, files.randomInterval)
+      let scheduleStatus = 'yes'
       /* Create Event Bridge schedule to manage this on AWS. */
-
-
       for (const utcTime of schedule) {
         const res = await putScheduleEvent(participant.participantIdentifier, utcTime)
         if (res == null) {
@@ -140,23 +134,24 @@ async function main(args) {
             ParticipantId : participant.participantIdentifier,
             RuleName : createRuleName(participant.participantIdentifier, utcTime)
           })
+          scheduleStatus = 'failed'  // In case of a partial failure.
         }
       }
-      // Add the new date to the participant custom field.
+      // Update the participant "scheduleGenerated" custom field with the status.
       let payload = {
         'id' : participant.id,
         'customFields' : {}
       }
-      payload.customFields[customFieldName] = formatDateUTC(localTime)
+      payload.customFields[customFields.scheduleGenerated] = scheduleStatus
       const response = await mdh.updateParticipant(token, rksProjectId, payload)
       /* TODO: Make sure to check the response to know if this
        * has been set for the user. If not raise an error in the logs.
        */
-      console.log('Added schedule for participant '+participant.participantIdentifier+' for '+formatDateUTC(localTime)+'(local)')
+      console.log('Added schedule for participant '+participant.participantIdentifier)
       summaryLog.Participants.RulesAdded += 1
     }
     else {
-      console.log('Participant '+participant.participantIdentifier+' already has schedule for '+formatDateUTC(localTime)+'(local)')
+      console.log('Participant '+participant.participantIdentifier+' already has schedule')
     }
   }
 
@@ -336,34 +331,30 @@ async function deleteParticipantRules(participantId, currentDate) {
  */
 async function putScheduleEvent(participantId, utcDate) {
   // Test out Event Bridge here.
-  throw new Error('Modify')
   let schedule_name = createRuleName(participantId, utcDate)
+
   const params = {
     Name: schedule_name,
     Description: 'Automatic schedule generated for project '+project_name,
-    ScheduleExpression: 'cron('+utcDate.getUTCMinutes()+' '+utcDate.getUTCHours()+' '+utcDate.getUTCDate()+' '+(utcDate.getUTCMonth()+1)+' ? '+utcDate.getUTCFullYear()+')', // (hh mm dom mon ? yyyy)
+    GroupName: eventGroup,
+    ScheduleExpression: 'cron('+utcDate.minute+' '+utcDate.hour+' '+utcDate.day+' '+utcDate.month+' ? '+utcDate.year+')', // (hh mm dom mon ? yyyy)
+    FlexibleTimeWindow: {
+      Mode: 'OFF',
+    },
     State: 'ENABLED',
+    Target: {
+      Arn: targetArn,
+      RoleArn: roleArn,
+    },
     Tags: [
       {Key: 'project', Value: project_name},
       {Key: 'Partcipant', Value: participantId}
     ],
+    ActionAfterCompletion: 'DELETE',
   }
 
- const res = await eventBridge.addSchedule(params)
-  // If the rule was created we will now go ahead and attach a target (lambda invoke) to it.
-  if (res != null) {
-    const target = {
-      Rule: schedule_name,
-      Targets: [
-        {
-          Arn: targetArn,
-          Id: 'TargetLambdaFunction',
-          Input: JSON.stringify({'pid': participantId})
-        }
-      ],
-    }
-    const tar = await eventBridge.addTarget(target)
-  }
+  // Add this to the AWS Event Scheduler.
+  const res = await eventScheduler.addSchedule(params)
 
   return res
 }
@@ -454,7 +445,8 @@ function makeRandomSchedule(participant, startDate, wakesleep, anchors, randomIn
         fixedLocalTime = todayStart.plus(Duration.fromObject({minutes:todayAnchors[survey]}))
       }
       else {  // A negative daily anchor is offsetted from the sleep time.
-        fixedLocalTime = todayEnd.minus(Duration.fromObject({minutes:todayAnchors[survey]}))
+        // We still use .plus instead of .minus
+        fixedLocalTime = todayEnd.plus(Duration.fromObject({minutes:todayAnchors[survey]}))
       }
       // Add the pre-determined random offset for this (day, survey)
       let randomLocalTime = fixedLocalTime.plus(Duration.fromObject({minutes:randomInterval[day][survey]}))
