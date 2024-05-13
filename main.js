@@ -21,6 +21,7 @@ const project_name = process.env.PROJECT_NAME
 const roleArn = process.env.AWS_ROLE_ARN
 const targetArn = process.env.AWS_TARGET_ARN
 const eventGroup = process.env.AWS_EVENT_GROUP
+const notification_survey = process.env.NOTIFICATION_SURVEY
 
 const customFieldName = 'scheduleGenerated'
 const randomNotificationReady = 'randomNotificationReady'
@@ -94,6 +95,21 @@ async function main(args) {
   // Read in the supporting files needed.
   files = supportingFiles()
 
+  // Method which popullates the survey and notification arrays to be used as
+  // payloads in for event bridge invocations.
+  let surveys = []
+  let notifications = []
+  let ns_buff = notification_survey.split(',')
+  for (const ns of ns_buff) {
+    let buff = ns.split(':')
+    // We need to have notificatoin_id:survey_id
+    if (buff.length < 2) {
+      continue
+    }
+    notifications.push(buff[0])
+    surveys.push(buff[1])
+  }
+
   const participants = await mdh.getAllParticipants(token, rksProjectId)
   for (const participant of participants.participants) {
     if (participant.demographics.timeZone == null)
@@ -125,9 +141,13 @@ async function main(args) {
       // Run the schedule, so we can create the random notification times.
       let schedule = makeRandomSchedule(participant, startDate, wakesleep, files.anchors, files.randomInterval)
       let scheduleStatus = 'yes'
+      let ns_index = 0
+      /* This is a hacky way right now. We cycle through the notifications and survey ids.
+       * This works since the order is the same with which the schedules are made.*/
       /* Create Event Bridge schedule to manage this on AWS. */
       for (const utcTime of schedule) {
-        const res = await putScheduleEvent(participant.participantIdentifier, utcTime)
+        const res = await putScheduleEvent(participant.participantIdentifier, utcTime, notifications[ns_index], surveys[ns_index])
+        ns_index = (ns_index + 1) % notifications.length
         if (res == null) {
           // TODO: Add to logs that schedule could not be created and do not update the MDH bits.
           summaryLog.Participants.Failed.push({
@@ -329,7 +349,7 @@ async function deleteParticipantRules(participantId, currentDate) {
 /*
  * Method which creates the event bridge schedule and attaches the target lambda function to it.
  */
-async function putScheduleEvent(participantId, utcDate) {
+async function putScheduleEvent(participantId, utcDate, notification, survey) {
   // Test out Event Bridge here.
   let schedule_name = createRuleName(participantId, utcDate)
 
@@ -345,6 +365,11 @@ async function putScheduleEvent(participantId, utcDate) {
     Target: {
       Arn: targetArn,
       RoleArn: roleArn,
+      Input: JSON.stringify({
+        'pid': participantId,
+        'nid': notification,
+        'sid': survey,
+      }),
     },
     Tags: [
       {Key: 'project', Value: project_name},
