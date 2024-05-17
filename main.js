@@ -118,36 +118,40 @@ async function main(args) {
     summaryLog.Participants.Parsed += 1
 
     let scheduleGenerated = getCustomField(participant, customFields.scheduleGenerated)
-    let custStartDate = getCustomField(participant, customFields.startDate)
-    // Parse this into luxon:DateTime with the participant timezone.
-    let startDate = DateTime.fromISO(custStartDate).setZone(participant.demographics.timeZone)
-    if (Number.isNaN(startDate.year)) {
-      // There was an error parsing the format.
-      logParticipantError(participant, 'Invalid ISO DateTime format for custom field startDate. Got '+custStartDate+ ' expected yyyy-mm-dd')
-      continue
-    }
-    // Get the wake and sleep times and populate them.
-    let wakesleep = populateWakeSleep(participant)
-
-    /*
+        /*
       const res = await deleteParticipantRules(participant.participantIdentifier, formatDateUTC(localTime))
       summaryLog.Deleted.Marked += res.markedForDelete
       summaryLog.Deleted.Deleted += res.deleted
     */
 
     if (scheduleGenerated === 'no') { /* Only generate a schedule if it has not already been generated before. */
+      let custStartDate = getCustomField(participant, customFields.startDate)
+      // Parse this into luxon:DateTime with the participant timezone.
+      let startDate = DateTime.fromISO(custStartDate).setZone(participant.demographics.timeZone)
+      if (Number.isNaN(startDate.year)) {
+        // There was an error parsing the format.
+        logParticipantError(participant, 'Invalid ISO DateTime format for custom field startDate. Got '+custStartDate+ ' expected yyyy-mm-dd')
+        continue
+      }
+      // Get the wake and sleep times and populate them.
+      let wakesleep = populateWakeSleep(participant)
+
+
       summaryLog.Participants.NotificationReady += 1
       summaryLog.Participants.MarkedForAddition += 1
       // Run the schedule, so we can create the random notification times.
       let schedule = makeRandomSchedule(participant, startDate, wakesleep, files.anchors, files.randomInterval)
       let scheduleStatus = 'yes'
       let ns_index = 0
+      let notification_number = 1
       /* This is a hacky way right now. We cycle through the notifications and survey ids.
        * This works since the order is the same with which the schedules are made.*/
       /* Create Event Bridge schedule to manage this on AWS. */
       for (const utcTime of schedule) {
-        const res = await putScheduleEvent(participant.participantIdentifier, utcTime, notifications[ns_index], surveys[ns_index])
+        const res = await putScheduleEvent(participant.participantIdentifier, utcTime,
+                                           notifications[ns_index], surveys[ns_index], notification_number)
         ns_index = (ns_index + 1) % notifications.length
+        notification_number = notification_number + 1
         if (res == null) {
           // TODO: Add to logs that schedule could not be created and do not update the MDH bits.
           summaryLog.Participants.Failed.push({
@@ -349,7 +353,7 @@ async function deleteParticipantRules(participantId, currentDate) {
 /*
  * Method which creates the event bridge schedule and attaches the target lambda function to it.
  */
-async function putScheduleEvent(participantId, utcDate, notification, survey) {
+async function putScheduleEvent(participantId, utcDate, notification, survey, notification_number) {
   // Test out Event Bridge here.
   let schedule_name = createRuleName(participantId, utcDate)
 
@@ -369,6 +373,7 @@ async function putScheduleEvent(participantId, utcDate, notification, survey) {
         'pid': participantId,
         'nid': notification,
         'sid': survey,
+        'number': notification_number
       }),
     },
     Tags: [
@@ -378,8 +383,14 @@ async function putScheduleEvent(participantId, utcDate, notification, survey) {
     ActionAfterCompletion: 'DELETE',
   }
 
+  let res = null
   // Add this to the AWS Event Scheduler.
-  const res = await eventScheduler.addSchedule(params)
+  try {
+    res = await eventScheduler.addSchedule(params)
+  }
+  catch (err) {
+    console.log(err)
+  }
 
   return res
 }
@@ -445,9 +456,25 @@ function makeRandomSchedule(participant, startDate, wakesleep, anchors, randomIn
     let todayEnd = startDate.plus(Duration.fromObject({days:day}))
     let todayAnchors = null
 
-    // Check if this is the weekend (Sat, Sun) weekday of 6,7
-    // and then adjust the start and end times accordingly based on wake and sleep
-    if (todayStart.weekday == 6 || todayStart.weekday == 7) {
+    /*
+     * Based on weekday or weekend we need to anchor these on different wake and sleep times.
+     * Sun : weekend_wake, weekday_sleep
+     * Mon-Th : weekday_wake, weekday_sleep
+     * Fri : weekday_wake, weekend_sleep
+     * Sat : weekend_wake, weekend_sleep
+     */
+
+    if (todayStart.weekday == 7) {  // Sunday
+      todayStart = todayStart.plus(wakesleep.weekend.wake)
+      todayEnd = todayEnd.plus(wakesleep.weekday.sleep)
+      todayAnchors = anchors.weekend  // Random offsets.
+    }
+    else if (todayStart.weekday == 5) {  // Friday
+      todayStart = todayStart.plus(wakesleep.weekday.wake)
+      todayEnd = todayEnd.plus(wakesleep.weekend.sleep)
+      todayAnchors = anchors.weekday
+    }
+    else if (todayStart.weekday == 6) {  // Saturday
       todayStart = todayStart.plus(wakesleep.weekend.wake)
       todayEnd = todayEnd.plus(wakesleep.weekend.sleep)
       todayAnchors = anchors.weekend
