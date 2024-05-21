@@ -136,7 +136,6 @@ async function main(args) {
       // Get the wake and sleep times and populate them.
       let wakesleep = populateWakeSleep(participant)
 
-
       summaryLog.Participants.NotificationReady += 1
       summaryLog.Participants.MarkedForAddition += 1
       // Run the schedule, so we can create the random notification times.
@@ -147,9 +146,17 @@ async function main(args) {
       /* This is a hacky way right now. We cycle through the notifications and survey ids.
        * This works since the order is the same with which the schedules are made.*/
       /* Create Event Bridge schedule to manage this on AWS. */
+
+      // Get the current time in UTC so we can skip any dates before that to keep AWS Scheduler happy.
+      const currentUtc = DateTime.utc()
+
       for (const utcTime of schedule) {
-        const res = await putScheduleEvent(participant.participantIdentifier, utcTime,
+        let res = null
+        // Silently ignore any dates that are older than the current date and don't add them.
+        if (utcTime > currentUtc) {
+            res = await putScheduleEvent(participant.participantIdentifier, utcTime,
                                            notifications[ns_index], surveys[ns_index], notification_number)
+        }
         ns_index = (ns_index + 1) % notifications.length
         notification_number = notification_number + 1
         if (res == null) {
