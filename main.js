@@ -171,9 +171,13 @@ async function main(args) {
             res = await putScheduleEvent(participant.participantIdentifier, utcTime,
                                            notifications[ns_index], surveys[ns_index], notification_number)
         }
+        else {
+          // Set the right error flag so it is easier for us to know what is going on.
+          scheduleStatus = 'backfilled'
+        }
         ns_index = (ns_index + 1) % notifications.length
         notification_number = notification_number + 1
-        if (res == null) {
+        if (res == null && scheduleStatus != 'backfilled') {
           // TODO: Add to logs that schedule could not be created and do not update the MDH bits.
           summaryLog.Participants.Failed.push({
             ParticipantId : participant.participantIdentifier,
