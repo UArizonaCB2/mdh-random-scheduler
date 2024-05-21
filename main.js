@@ -127,8 +127,21 @@ async function main(args) {
     if (scheduleGenerated === 'no') { /* Only generate a schedule if it has not already been generated before. */
       let custStartDate = getCustomField(participant, customFields.startDate)
       // Parse this into luxon:DateTime with the participant timezone.
-      let startDate = DateTime.fromISO(custStartDate).setZone(participant.demographics.timeZone)
-      if (Number.isNaN(startDate.year)) {
+      let startDate = null
+      try {
+        const dateBuff = custStartDate.split('-')
+        if (dateBuff.length < 3) {
+          throw new Error('Check your dashes in the dates')
+        }
+        startDate = DateTime.fromObject({
+          year : dateBuff[0],
+          month : dateBuff[1],
+          day : dateBuff[2]
+        }, {
+          zone : participant.demographics.timeZone
+        })
+      }
+      catch (e) {
         // There was an error parsing the format.
         logParticipantError(participant, 'Invalid ISO DateTime format for custom field startDate. Got '+custStartDate+ ' expected yyyy-mm-dd')
         continue
@@ -139,7 +152,8 @@ async function main(args) {
       summaryLog.Participants.NotificationReady += 1
       summaryLog.Participants.MarkedForAddition += 1
       // Run the schedule, so we can create the random notification times.
-      let schedule = makeRandomSchedule(participant, startDate, wakesleep, files.anchors, files.randomInterval)
+      let schedule = makeRandomSchedule(participant, startDate, wakesleep, files.anchors, files.randomInterval, true)
+
       let scheduleStatus = 'yes'
       let ns_index = 0
       let notification_number = 1
