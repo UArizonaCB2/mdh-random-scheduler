@@ -296,6 +296,8 @@ function makeRandomSchedule(participant, times, randomInterval) {
     randomUTCTimes.push(utctime)
   }
 
+  console.log(log)
+
   return randomUTCTimes
 }
 
@@ -309,10 +311,10 @@ function getPartcipantUTCOffset(participant) {
   let minuteOffset = 0
   // Need to do a few extra things for the sign.
   if (parseInt(buff[0]) < 0) {
-    minuteOffset = buff[0]*60 - buff[1]
+    minuteOffset = parseInt(buff[0])*60 - parseInt(buff[1])
   }
   else {
-    minuteOffset = buff[0]*60 + buff[1]
+    minuteOffset = parseInt(buff[0])*60 + parseInt(buff[1])
   }
 
   return minuteOffset
