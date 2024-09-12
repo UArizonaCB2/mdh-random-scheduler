@@ -17,7 +17,7 @@ async function getFromApi(accessToken, resourceUrl, queryParams = {}) {
     }
   });
 
-  await api.get(resourceUrl, queryParams)
+  await api.get(resourceUrl, {params: queryParams})
   .then(function (apiResponse) {
     if (apiResponse.status != '200') {
       logResponse(apiResponse.data);
@@ -51,13 +51,13 @@ async function postToApi(accessToken, resourceUrl, postParams = {}) {
     }
     else {
       data = apiResponse.data;
+      return data;
     }
   })
   .catch(function (error) {
     logResponse(error);
     return error;
   });
-  return data;
 }
 
 async function putToApi(accessToken, resourceUrl, postParams = {}) {
@@ -86,6 +86,8 @@ async function putToApi(accessToken, resourceUrl, postParams = {}) {
   });
   return data;
 }
+
+
 
 async function getAccessToken(rksServiceAccount, privateKey, expires_ms=200) {
   const audienceString = `${baseApiUri}/identityserver/connect/token`;
@@ -138,15 +140,25 @@ function logResponse(response) {
 }
 
 // Method which returns project device data.
-function getDeviceData(token, projectId, params) {
+async function getDeviceData(token, projectId, params) {
+  //const participantResourceUrl = `/api/v1/administration/projects/` + rksProjectId + '/participants';
   const resourceUrl = '/api/v1/administration/projects/'+projectId+'/devicedatapoints'
-  return getFromApi(token, resourceUrl, params)
+  return await getFromApi(token, resourceUrl, params)
 }
 
 // Method which gets all the participants.
-function getAllParticipants(token, projectId) {
+async function getAllParticipants(token, projectId) {
   const resourceUrl = '/api/v1/administration/projects/'+projectId+'/participants'
-  return getFromApi(token, resourceUrl)
+  const params = {
+    'pageSize': 100
+  }
+  return await getFromApi(token, resourceUrl, params)
+}
+
+// Method which will create a new task for the participant.
+async function createTask(token, projectId, params) {
+  const resourceUrl = '/api/v1/administration/projects/'+projectId+'/surveytasks'
+  return await postToApi(token, resourceUrl, params)
 }
 
 // Method which updates the participants.
@@ -156,10 +168,28 @@ function updateParticipant(token, projectId, params) {
   return putToApi(token, resourceUrl, params)
 }
 
+// Method which gets all the tasks for a given participant.
+function getSurveyTasks(token, projectId, params) {
+  const resourceUrl = '/api/v1/administration/projects/'+projectId+'/surveytasks'
+  return getFromApi(token, resourceUrl, params)
+}
+
+// Method which closes a task.
+function closeTask(token, projectId, taskId) {
+  const resourceUrl = '/api/v1/administration/projects/'+projectId+'/surveytasks/'+taskId
+  const params = {
+    status: 'closed'
+  }
+  return putToApi(token, resourceUrl, params)
+}
+
 exports.getAccessToken = getAccessToken
 exports.getFromApi = getFromApi
 exports.postToApi = postToApi
-exports.putToApi = putToApi
 exports.getDeviceData = getDeviceData
 exports.getAllParticipants = getAllParticipants
+exports.createTask = createTask
+exports.putToApi = putToApi
 exports.updateParticipant = updateParticipant
+exports.getSurveyTasks = getSurveyTasks
+exports.closeTask = closeTask
