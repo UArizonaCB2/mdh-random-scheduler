@@ -19,7 +19,10 @@ require('dotenv').config()
 const rksProjectId = process.env.RKS_PROJECT_ID
 const project_name = process.env.PROJECT_NAME
 const roleArn = process.env.AWS_ROLE_ARN
+/* This is the ARN for the main notification sendor. */
 const targetArn = process.env.AWS_TARGET_ARN
+/* This is the ARN for the reminder notification sender. */
+const reminderArn = process.env.AWS_REMINDER_ARN
 const eventGroup = process.env.AWS_EVENT_GROUP
 const notification_survey = process.env.NOTIFICATION_SURVEY
 
@@ -167,6 +170,8 @@ async function main(args) {
       for (const utcTime of schedule) {
         let res = null
         // Silently ignore any dates that are older than the current date and don't add them.
+        //console.log(utcTime)
+        //continue
         if (utcTime > currentUtc) {
             res = await putScheduleEvent(participant.participantIdentifier, utcTime,
                                            notifications[ns_index], surveys[ns_index], notification_number)
@@ -375,6 +380,13 @@ async function deleteParticipantRules(participantId, currentDate) {
   }
 }
 
+/**
+ * Method which creates the event bridge schedule for 5 and 15 minute reminders.
+ */
+async function putReminderEvent(participantId, utcDate) {
+
+}
+
 /*
  * Method which creates the event bridge schedule and attaches the target lambda function to it.
  */
@@ -428,6 +440,13 @@ async function putScheduleEvent(participantId, utcDate, notification, survey, no
  */
 function createRuleName(participantId, date) {
   return project_name + '_' + participantId + '_' + formatDate(date) + '_' + date.hour + '_' + date.minute
+}
+
+/*
+ * Method to create rule name for the reminder notification
+*/
+function createReminderName(participantId, date) {
+  return project_name + '_' + 'reminder' + '_' + participantId + '_' + formatDate(date) + '_' + date.hour + '_' + date.minute
 }
 
 /*
