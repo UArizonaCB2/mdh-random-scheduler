@@ -23,6 +23,7 @@ const roleArn = process.env.AWS_ROLE_ARN
 const targetArn = process.env.AWS_TARGET_ARN
 /* This is the ARN for the reminder notification sender. */
 const reminderArn = process.env.AWS_REMINDER_ARN
+const reminderIntervals = process.env.REMINDER_INTERVALS
 const eventGroup = process.env.AWS_EVENT_GROUP
 const notification_survey = process.env.NOTIFICATION_SURVEY
 
@@ -170,11 +171,11 @@ async function main(args) {
       for (const utcTime of schedule) {
         let res = null
         // Silently ignore any dates that are older than the current date and don't add them.
-        //console.log(utcTime)
-        //continue
         if (utcTime > currentUtc) {
-            res = await putScheduleEvent(participant.participantIdentifier, utcTime,
+          res = await putScheduleEvent(participant.participantIdentifier, utcTime,
                                            notifications[ns_index], surveys[ns_index], notification_number)
+          /* TODO: Also add the reminder notifications here. */
+          await putReminderEvent(participant.participantIdentifier, utcTime)
         }
         else {
           // Set the right error flag so it is easier for us to know what is going on.
@@ -384,7 +385,60 @@ async function deleteParticipantRules(participantId, currentDate) {
  * Method which creates the event bridge schedule for 5 and 15 minute reminders.
  */
 async function putReminderEvent(participantId, utcDate) {
+  // Split the reminder interval variable to get the various reminder intervals in minutes.
+  let intervals = reminderIntervals.split(',')
+  if (intervals.length <= 0) {
+    console.log('Warning : Invalid interval string in environment variable')
+    return
+  }
 
+  // Go ahead and clean up the interval strings and also change them into integers.
+  try {
+    for (let a=0; a < intervals.length; a++) {
+      intervals[a] = parseInt(intervals[a].trim())
+    }
+  }
+  catch(ex) {
+    console.log(ex) // When a string cannot be converted into integer.
+  }
+
+  // For each interval we create a new schedule instance that will get added.
+  for (let a=0;a < intervals.length;a++) {
+    const reminderDate = utcDate.plus(Duration.fromObject({minutes:intervals[a]}))
+    const scheduleName = createReminderName(participantId, reminderDate)
+
+    const params = {
+      Name: scheduleName,
+      Description: 'Automatic reminder generated for project '+project_name,
+      GroupName: eventGroup,
+      ScheduleExpression: 'cron('+reminderDate.minute+' '+reminderDate.hour+' '+reminderDate.day+' '+reminderDate.month+' ? '+reminderDate.year+')', // (hh mm dom mon ? yyyy)
+      FlexibleTimeWindow: {
+        Mode: 'OFF',
+      },
+      State: 'ENABLED',
+      Target: {
+        Arn: reminderArn,
+        RoleArn: roleArn,
+        Input: JSON.stringify({
+          'pid': participantId,
+        }),
+      },
+      Tags: [
+        {Key: 'project', Value: project_name},
+        {Key: 'Partcipant', Value: participantId}
+      ],
+      ActionAfterCompletion: 'DELETE',
+    }
+
+    let res = null
+    // Add this to the AWS Event Scheduler.
+    try {
+      res = await eventScheduler.addSchedule(params)
+    }
+    catch (err) {
+      console.log(err)
+    }
+  }
 }
 
 /*
