@@ -1,11 +1,15 @@
+/*
+ * Author: Shravan Aras <shravanaras@arizona.edu>
+ * Project: EMA
+ * Original Date: 01/2024
+ * Major Update 2.0 Start: 10/2024
+ */
+
 const mdh = require('./mdh')
 const eventBridge = require('./EventBridge')
 const secretManager = require('./SecretsManager')
+const {DateTime, Duration} = require('luxon')
 require('dotenv').config()
-
-/*
- * TODO:
- */
 
 // **NOTE!** In a real production app you would want these to be sourced from real environment variables. The .env file is just
 // a convenience for development.
@@ -14,7 +18,9 @@ const project_name = process.env.PROJECT_NAME
 const roleArn = process.env.AWS_ROLE_ARN
 const targetArn = process.env.AWS_TARGET_ARN
 
+/* Anchor times for the EMA solution. */
 const times = ['10:12', '12:24', '14:36', '16:48', '19:00']
+/* Random interval for the EMA solution. */
 const randomInterval = 15
 const customFieldName = 'scheduleGenerated'
 const randomNotificationReady = 'randomNotificationReady'
@@ -69,7 +75,6 @@ async function main(args) {
     },
     Deleted : {
       Marked : 0,
-      Deleted : 0,
       Failed : []
     }
   }
@@ -81,13 +86,11 @@ async function main(args) {
 
     summaryLog.Participants.Parsed += 1
 
-    let localTime = getParticipantLocalTime(participant)
+    /* Luxon date object of current date in participant local time zone. */
+    let localTime_lux = getParticipantLocalTime(participant)
+    /* Date (YYYY-MM-DD) till which the schedule has already been generated. */
     let generatedTill = getCustomField(participant, customFieldName)
     let notificationReady = getCustomField(participant, randomNotificationReady)
-
-    const res = await deleteParticipantRules(participant.participantIdentifier, formatDateUTC(localTime))
-    summaryLog.Deleted.Marked += res.markedForDelete
-    summaryLog.Deleted.Deleted += res.deleted
 
     // Only move ahead if EMA notifications are enabled for the participant.
     if (notificationReady != 'yes') {
@@ -96,20 +99,35 @@ async function main(args) {
 
     summaryLog.Participants.NotificationReady += 1
 
-    if (generatedTill == null || generatedTill.trim() != formatDateUTC(localTime)) {
+    /*
+     * Construct a luxon DateTime object from generatedTill string in local participant timezone.
+     */
+    let generatedTill_lux = localTime_lux
+    console.log(generatedTill)
+    if (generatedTill != null && generatedTill != '') {
+      generatedTill = generatedTill.trim()
+      generatedTill_lux = DateTime.fromFormat(generatedTill, 'yyyy-MM-dd',
+                                              {zone: getParticipantTimeZone(participant)})
+    }
+
+    let timeDiff_dur = localTime_lux.diff(generatedTill_lux) /* A Luxon Duration object. */
+    if (generatedTill == null ||
+        generatedTill == '' ||
+        timeDiff_dur.get('hour') > 24) {
       summaryLog.Participants.MarkedForAddition += 1
       // Run the schedule, so we can create the random notification times.
-      let schedule = makeRandomSchedule(participant, times, randomInterval)
+      // An array containing Luxon.DateTime objects for the random schedule.
+      const schedule_lux = makeRandomSchedule(participant, times, randomInterval, true)
 
       /* Create Event Bridge schedule to manage this on AWS. */
-
-      for (const utcTime of schedule) {
-        const res = await putScheduleEvent(participant.participantIdentifier, utcTime)
+      /* DISABLED
+      for (const utcTime_lux of schedule_lux) {
+        const res = await putScheduleEvent(participant.participantIdentifier, utcTime_lux)
         if (res == null) {
           // TODO: Add to logs that schedule could not be created and do not update the MDH bits.
           summaryLog.Participants.Failed.push({
             ParticipantId : participant.participantIdentifier,
-            RuleName : createRuleName(participant.participantIdentifier, utcTime)
+            RuleName : createRuleName(participant.participantIdentifier, utcTime_lux)
           })
         }
       }
@@ -118,16 +136,17 @@ async function main(args) {
         'id' : participant.id,
         'customFields' : {}
       }
-      payload.customFields[customFieldName] = formatDateUTC(localTime)
+      payload.customFields[customFieldName] = formatDate(localTime_lux)
       const response = await mdh.updateParticipant(token, rksProjectId, payload)
+      */
       /* TODO: Make sure to check the response to know if this
        * has been set for the user. If not raise an error in the logs.
        */
-      console.log('Added schedule for participant '+participant.participantIdentifier+' for '+formatDateUTC(localTime)+'(local)')
+      console.log('Added schedule for participant '+participant.participantIdentifier+' for '+formatDate(localTime_lux)+'(local)')
       summaryLog.Participants.RulesAdded += 1
     }
     else {
-      console.log('Participant '+participant.participantIdentifier+' already has schedule for '+formatDateUTC(localTime)+'(local)')
+      console.log('Participant '+participant.participantIdentifier+' already has schedule for '+formatDate(localTime_lux)+'(local)')
     }
   }
 
@@ -135,9 +154,12 @@ async function main(args) {
 }
 
 /*
+ * DEPRECIATED - Since we have moved to using EventScheduler from EventBridge rules.
  * Method which given a pid, deletes all the rules prior to the current date of the participant.
  */
 async function deleteParticipantRules(participantId, currentDate) {
+  throw new Error('Depreciated Method : deleteParticipantRules()')
+
   const prefix = project_name + '_' + participantId
   let participantRules = await eventBridge.listRulesByPrefix(prefix)
   // Convert currentDate from string to a date object.
@@ -213,9 +235,12 @@ async function putScheduleEvent(participantId, utcDate) {
 
 /*
  * Method which creates the rule name.
+ * @param {string} participantId - MDH participant ID.
+ * @param {luxon:DateTime} date - date to add to the rule name.
+ * @returns {string} rule name
  */
-function createRuleName(participantId, utcDate) {
-  return project_name + '_' + participantId + '_' + formatDateUTC(utcDate) + '_' + utcDate.getUTCHours() + '_' + utcDate.getUTCMinutes()
+function createRuleName(participantId, date) {
+  return project_name + '_' + participantId + '_' + formatDate(date) + '_' + date.hour + '_' + date.minute
 }
 
 /*
@@ -223,11 +248,11 @@ function createRuleName(participantId, utcDate) {
  * Writing my own so there is not automatic timezone conversion when using the library
  * string methods.
  * So if this runs on the servers, this will automatically be converted to localtime.
- * @params {Date} date - Date object to format.
+ * @params {luxon:DateTime} date - Date object to format.
  * @returns {stirng} Formatted string of the date YYYY-MM-DD
  */
-function formatDateUTC(date) {
-  return date.getUTCFullYear() + '-' + (date.getUTCMonth() + 1) + '-' + date.getUTCDate()
+function formatDate(date) {
+  return date.get('year') + '-' + date.get('month') + '-' + date.get('day')
 }
 
 /*
@@ -249,87 +274,89 @@ function getCustomField(participant, fieldName) {
  * @param {object} participant - Object that contains all the participant information.
  * @param {array} times - A array of strings (hh:mm) around which the randomization will take place.
  * @param {int} randomInternal - The number of minutes around the actual time to create the random schedule.
+ * @returns {array[Luxon.DateTime]} - An array of random schedules for the participant for the current day in UTC.
  * */
-function makeRandomSchedule(participant, times, randomInterval) {
+function makeRandomSchedule(participant, times, randomInterval, logger=false) {
   let randomUTCTimes = []
 
-  if (participant.demographics.utcOffset == null)
+  if (participant.demographics.timeZone == null)
     return []
 
-  let minuteOffset = getPartcipantUTCOffset(participant)
-  // Now let us get the current local time for this participant (saved in the object as UTC).
-  let today = getParticipantLocalTime(participant)
-
-  let year = today.getUTCFullYear()
-  let month = today.getUTCMonth()
-  let day = today.getUTCDay()
+  const today = getParticipantLocalTime(participant)
 
   let log = []
   for (const time of times) {
-    let hh = time.split(':')[0]
-    let min = time.split(':')[1]
+    const hh = Number.parseInt(time.split(':')[0])
+    const min = Number.parseInt(time.split(':')[1])
     let rand = getRandom(1, randomInterval*2)
+    /* The random interval in minutes that we need to add to the anchor points. */
     rand = (rand < randomInterval) ? -1 * rand : rand - randomInterval
 
-    // Passing .getTime() does not do any automatic timezone conversion.
-    let ltime = new Date(today.getTime())
-    // Convert it to midnight.
-    ltime.setTime(ltime.getTime() - ltime.getUTCHours()*60*60*1000
-                  - ltime.getUTCMinutes()*60*1000
-                  - ltime.getUTCSeconds()*1000
-                  - ltime.getUTCMilliseconds())
-    // Add the hh:mm offset for the correct anchor point.
-    ltime.setTime(ltime.getTime() + parseInt(hh)*60*60*1000 + parseInt(min)*60*1000)
-    // For debug purposes what is the fixed local time (anchor)
-    let fixedLocalTime = new Date(ltime.getTime())
-    // Adjust the time with the random offset
-    ltime.setTime(ltime.getTime() + rand*60*1000)
-    // Convert the time back into UTC.
-    utctime = convToUTC(ltime, minuteOffset)
-    log.push({'id': participant.participantIdentifier,
-                   'fixedLocalTime': fixedLocalTime.toUTCString(),
-                   'randomLocalTime': ltime.toUTCString(),
-                   'randomUTCTime': utctime.toUTCString(),
-                   'randomOffsetMins': rand,
-                   'utcOffset': minuteOffset})
+    // Create a Luxon object for the anchor point for the current day (local time).
+    const anchorTime_lux = DateTime.fromObject({
+      year: today.get('year'),
+      month: today.get('month'),
+      day: today.get('day'),
+      hour: hh,
+      minute: min
+    }, {
+      zone : getParticipantTimeZone(participant)
+    })
 
-    randomUTCTimes.push(utctime)
+    // Add a duration object for the random minutes to this.
+    const dt_dur = Duration.fromObject({
+      minutes: rand
+    })
+
+    // Add the duration to the anchor data to create the new random time.
+    const randTime_lux = anchorTime_lux.plus(dt_dur)
+
+    // Convert the time back into UTC.
+    utctime_lux = convToUTC(randTime_lux)
+    log.push({'id': participant.participantIdentifier,
+              'timeZone': getParticipantTimeZone(participant),
+              'fixedLocalTime': anchorTime_lux.toLocaleString(DateTime.DATETIME_FULL),
+              'randomLocalTime': randTime_lux.toLocaleString(DateTime.DATETIME_FULL),
+              'randomUTCTime': utctime_lux.toLocaleString(DateTime.DATETIME_FULL),
+              'randomOffsetMins': rand})
+
+    randomUTCTimes.push(utctime_lux)
   }
 
-  console.log(log)
+  if (logger) {
+    console.log(log)
+  }
 
   return randomUTCTimes
 }
 
 /* Get participant utc offset in minutes */
+/* DEPRECIATED - We have moved to timeZone locale now. */
 function getPartcipantUTCOffset(participant) {
-  if (participant.demographics.utcOffset == null)
+  throw new Error('Depreciated Method : getParticipantUTCOffset()')
+}
+
+/*
+ * Method which returns the participant timeZone string.
+ * @param {Object} participant - Object containing all the participant information.
+ */
+function getParticipantTimeZone(participant) {
+  if (participant === null) {
     return null
-
-  let utcOffset = participant.demographics.utcOffset
-  let buff = utcOffset.split(':')
-  let minuteOffset = 0
-  // Need to do a few extra things for the sign.
-  if (parseInt(buff[0]) < 0) {
-    minuteOffset = parseInt(buff[0])*60 - parseInt(buff[1])
-  }
-  else {
-    minuteOffset = parseInt(buff[0])*60 + parseInt(buff[1])
   }
 
-  return minuteOffset
+  return participant.demographics.timeZone
 }
 
 /*
  * Method which returns the current local time for the participant.
+ * Makes use of the luxon library.
  * @param {Object} participant - Object containing all the participant information.
- * @returns {DateTime} Current local date and time for the participant
+ * @returns {LuxonObject} Returns a luxon date object with local timeset.
  */
 function getParticipantLocalTime(participant) {
-
-  let minuteOffset = getPartcipantUTCOffset(participant)
-  // Now let us get the current local time for this participant.
-  let today = convToLocal(new Date(), minuteOffset)
+  let timeZone = getParticipantTimeZone(participant)
+  let today = DateTime.now().setZone(timeZone)
 
   return today
 }
@@ -345,26 +372,28 @@ function getRandom(min, max) {
 }
 
 /*
+ * DEPRECIATED / UNUSED
  * Convert the given time from utc to local time.
  * @param {DateTime} utcTime - UTC Time
  * @param {int} utcOffset - UTC offset in minutes
  * @returns {DateTime} Local time.
  */
 function convToLocal(utcTime, utcOffset) {
-  time = new Date(utcTime.getTime())  // Using .getTime() avoids any automatic timezone conversions.
-  time.setTime(time.getTime() + utcOffset*60*1000)
+  throw new Error('Depreciated Method : convToLocal()')
 
   return time
 }
 
 /*
  * Convert the given time from local to utc.
- * @param {DateTime} localTime - Local time
- * @param {int} utcOffset - UTC Offset
- * @returns {DateTime} UTC time
+ * @param {luxon:DateTime} localTime - Local time
+ * @returns {luxon:DateTime} UTC time
  */
-function convToUTC(localTime, utcOffset) {
-  return convToLocal(localTime, -1 * utcOffset)
+function convToUTC(localTime) {
+  if (localTime === null) {
+    return null
+  }
+  return localTime.toUTC()
 }
 
 exports.main = main

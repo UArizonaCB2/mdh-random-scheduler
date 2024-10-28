@@ -1,3 +1,7 @@
+# Files I never want to be added to git.
+.env
+env-*
+
 # Logs
 logs
 *.log
