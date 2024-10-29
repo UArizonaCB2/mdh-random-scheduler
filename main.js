@@ -6,8 +6,8 @@
  */
 
 const mdh = require('./mdh')
-const eventBridge = require('./EventBridge')
 const secretManager = require('./SecretsManager')
+const eventScheduler = require('./EventScheduler')
 const {DateTime, Duration} = require('luxon')
 require('dotenv').config()
 
@@ -17,6 +17,9 @@ const rksProjectId = process.env.RKS_PROJECT_ID
 const project_name = process.env.PROJECT_NAME
 const roleArn = process.env.AWS_ROLE_ARN
 const targetArn = process.env.AWS_TARGET_ARN
+
+// This is the AWS Event Group to which we need to add the schedules.
+const eventGroup = process.env.AWS_EVENT_GROUP
 
 /* Anchor times for the EMA solution. */
 const times = ['10:12', '12:24', '14:36', '16:48', '19:00']
@@ -87,10 +90,17 @@ async function main(args) {
     summaryLog.Participants.Parsed += 1
 
     /* Luxon date object of current date in participant local time zone. */
-    let localTime_lux = getParticipantLocalTime(participant)
+    const localTime_lux = getParticipantLocalTime(participant)
     /* Date (YYYY-MM-DD) till which the schedule has already been generated. */
     let generatedTill = getCustomField(participant, customFieldName)
-    let notificationReady = getCustomField(participant, randomNotificationReady)
+    const notificationReady = getCustomField(participant, randomNotificationReady)
+
+    /* IMPORTANT - Remove this when ready to deploy to production. */
+    const testParticipant = getCustomField(participant, 'test')
+    if (testParticipant != 'yes') {
+      continue
+    }
+    /* End of development deployment block. */
 
     // Only move ahead if EMA notifications are enabled for the participant.
     if (notificationReady != 'yes') {
@@ -113,22 +123,26 @@ async function main(args) {
     let timeDiff_dur = localTime_lux.diff(generatedTill_lux) /* A Luxon Duration object. */
     if (generatedTill == null ||
         generatedTill == '' ||
-        timeDiff_dur.get('hour') > 24) {
+        (timeDiff_dur.milliseconds / (1000 * 60 * 60)) > 24){
       summaryLog.Participants.MarkedForAddition += 1
       // Run the schedule, so we can create the random notification times.
       // An array containing Luxon.DateTime objects for the random schedule.
       const schedule_lux = makeRandomSchedule(participant, times, randomInterval, true)
 
-      /* Create Event Bridge schedule to manage this on AWS. */
-      /* DISABLED
+      // Get the current time in UTC so we can skip any dates before that to keep AWS Scheduler happy.
+      const currentUtc_lux = DateTime.utc()
+
       for (const utcTime_lux of schedule_lux) {
-        const res = await putScheduleEvent(participant.participantIdentifier, utcTime_lux)
-        if (res == null) {
-          // TODO: Add to logs that schedule could not be created and do not update the MDH bits.
-          summaryLog.Participants.Failed.push({
-            ParticipantId : participant.participantIdentifier,
-            RuleName : createRuleName(participant.participantIdentifier, utcTime_lux)
-          })
+        // Silently ignore any dates that are older than the current date and don't add them.
+        if (utcTime_lux > currentUtc_lux) {
+          const res = await putScheduleEvent(participant.participantIdentifier, utcTime_lux)
+          if (res == null) {
+            // TODO: Add to logs that schedule could not be created and do not update the MDH bits.
+            summaryLog.Participants.Failed.push({
+              ParticipantId : participant.participantIdentifier,
+              RuleName : createRuleName(participant.participantIdentifier, utcTime_lux)
+            })
+          }
         }
       }
       // Add the new date to the participant custom field.
@@ -138,7 +152,7 @@ async function main(args) {
       }
       payload.customFields[customFieldName] = formatDate(localTime_lux)
       const response = await mdh.updateParticipant(token, rksProjectId, payload)
-      */
+
       /* TODO: Make sure to check the response to know if this
        * has been set for the user. If not raise an error in the logs.
        */
@@ -198,39 +212,48 @@ async function deleteParticipantRules(participantId, currentDate) {
 }
 
 /*
- * Method which creates the event bridge schedule and attaches the target lambda function to it.
+ * Method which creates the event bridge event schedule and attaches the target lambda function to it.
+ *
+ * @param {string} participantId - Participants Identifier example MDH-...-.....
+ * @param {luxon} utcDate - A luxon date object containing the UTC date for when to invoke the schedule.
+ * @returns - not null value if the schedule was added successfully.
  */
 async function putScheduleEvent(participantId, utcDate) {
-  // Test out Event Bridge here.
   let schedule_name = createRuleName(participantId, utcDate)
   const params = {
     Name: schedule_name,
     Description: 'Automatic schedule generated for project '+project_name,
-    ScheduleExpression: 'cron('+utcDate.getUTCMinutes()+' '+utcDate.getUTCHours()+' '+utcDate.getUTCDate()+' '+(utcDate.getUTCMonth()+1)+' ? '+utcDate.getUTCFullYear()+')', // (hh mm dom mon ? yyyy)
+    GroupName: eventGroup,
+    ScheduleExpression: 'cron('+utcDate.minute+' '+utcDate.hour+' '+utcDate.day+' '+utcDate.month+' ? '+utcDate.year+')', // (hh mm dom mon ? yyyy)
+    FlexibleTimeWindow: {
+      Mode: 'OFF',
+    },
     State: 'ENABLED',
+    Target: {
+      Arn: targetArn,
+      RoleArn: roleArn,
+      Input: JSON.stringify({
+        'pid': participantId,
+      }),
+    },
     Tags: [
       {Key: 'project', Value: project_name},
       {Key: 'Partcipant', Value: participantId}
     ],
+    ActionAfterCompletion: 'DELETE',
   }
 
- const res = await eventBridge.addSchedule(params)
-  // If the rule was created we will now go ahead and attach a target (lambda invoke) to it.
-  if (res != null) {
-    const target = {
-      Rule: schedule_name,
-      Targets: [
-        {
-          Arn: targetArn,
-          Id: 'TargetLambdaFunction',
-          Input: JSON.stringify({'pid': participantId})
-        }
-      ],
-    }
-    const tar = await eventBridge.addTarget(target)
+  let res = null
+  // Add this to the AWS Event Scheduler.
+  try {
+    res = await eventScheduler.addSchedule(params)
+  }
+  catch (err) {
+    console.log(err)
   }
 
   return res
+
 }
 
 /*
