@@ -32,6 +32,9 @@ const randomInterval = 15
 const customFieldName = 'scheduleGenerated'
 const randomNotificationReady = 'randomNotificationReady'
 
+// Luxon time format for parsing and printing to string used through the project and MDH variables.
+const timeFormat = 'yyyy-MM-dd'
+
 async function main(args) {
   let rksServiceAccount = null
   let privateKey = null
@@ -120,10 +123,9 @@ async function main(args) {
      * Construct a luxon DateTime object from generatedTill string in local participant timezone.
      */
     let generatedTill_lux = localTime_lux
-    console.log(generatedTill)
     if (generatedTill != null && generatedTill != '') {
       generatedTill = generatedTill.trim()
-      generatedTill_lux = DateTime.fromFormat(generatedTill, 'yyyy-MM-dd',
+      generatedTill_lux = DateTime.fromFormat(generatedTill, timeFormat,
                                               {zone: getParticipantTimeZone(participant)})
     }
 
@@ -352,7 +354,7 @@ function createReminderName(participantId, date) {
  * @returns {stirng} Formatted string of the date YYYY-MM-DD
  */
 function formatDate(date) {
-  return date.get('year') + '-' + date.get('month') + '-' + date.get('day')
+  return date.toFormat(timeFormat)
 }
 
 /*
