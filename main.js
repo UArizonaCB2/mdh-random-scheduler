@@ -102,20 +102,16 @@ async function main(args) {
     let generatedTill = getCustomField(participant, customFieldName)
     const notificationReady = getCustomField(participant, randomNotificationReady)
 
-    /* IMPORTANT - Remove this when ready to deploy to production. */
+    /* IMPORTANT - Remove this when ready to deploy to production.
     const debugParticipant = getCustomField(participant, 'V2Debug')
     if (debugParticipant != 'yes') {
       continue
     }
-    /* End of development deployment block. */
+    End of development deployment block. */
 
-    // Only move ahead if EMA notifications are enabled for the participant.
-    /* IMPORTANT TODO: Uncomment this before pushing it to productions. */
-    /*
-      if (notificationReady != 'yes') {
-        continue
-      }
-    */
+    if (notificationReady != 'yes') {
+      continue
+    }
 
     summaryLog.Participants.NotificationReady += 1
 
