@@ -150,7 +150,7 @@ async function getDeviceData(token, projectId, params) {
 async function getAllParticipants(token, projectId) {
   const resourceUrl = '/api/v1/administration/projects/'+projectId+'/participants'
   const params = {
-    'pageSize': 100
+    'pageSize': 200 
   }
   return await getFromApi(token, resourceUrl, params)
 }
